@@ -1,0 +1,62 @@
+import { PermissionFlagsBits } from 'discord.js';
+import { option } from './options.js';
+import { hierarchyError, reason, requirePermission } from './helpers.js';
+import { reply, truncate } from '../services/respond.js';
+import { recordAudit } from '../services/audit.js';
+
+const reasonOption = option.text('reason', 'Reason for this action', false, { max_length: 400 });
+const targetOptions = [option.member(), reasonOption];
+const action = (name, description, permission, options, run) => ({ name, description, permission, options, run });
+
+async function member(c) { return c.interaction.guild.members.fetch(c.interaction.options.getUser('user').id); }
+async function authorizeTarget(c, target) {
+  const error = hierarchyError(c.interaction.member, target, c.interaction.guild.members.me);
+  if (error) { await reply(c.interaction, error); return false; }
+  return true;
+}
+async function logged(c, name, detail) {
+  await recordAudit(c.store, c.interaction.guildId, { actorId: c.interaction.user.id, action: `moderation.${name}`, detail });
+}
+async function authorizeRole(c, role) {
+  if (role.managed || role.id === c.interaction.guild.id) { await reply(c.interaction, 'That role cannot be assigned manually.'); return false; }
+  if (c.interaction.guild.members.me.roles.highest.comparePositionTo(role) <= 0) { await reply(c.interaction, 'That role is above my highest role.'); return false; }
+  if (c.interaction.member.id !== c.interaction.guild.ownerId && c.interaction.member.roles.highest.comparePositionTo(role) <= 0) {
+    await reply(c.interaction, 'You can only manage roles below your highest role.'); return false;
+  }
+  return true;
+}
+
+export const moderationActions = [
+  action('ban', 'Ban a member from the server', PermissionFlagsBits.BanMembers, [...targetOptions, option.integer('delete-days', 'Days of message history to delete', false, { min_value: 0, max_value: 7 })], async (c) => { const m = await member(c); if (!(await authorizeTarget(c, m))) return; const why = reason(c.interaction); await m.ban({ deleteMessageSeconds: (c.interaction.options.getInteger('delete-days') || 0) * 86400, reason: why }); await logged(c, 'ban', `${m.id}: ${why}`); return reply(c.interaction, `Banned ${m.user.tag}.`); }),
+  action('kick', 'Kick a member from the server', PermissionFlagsBits.KickMembers, targetOptions, async (c) => { const m = await member(c); if (!(await authorizeTarget(c, m))) return; const why = reason(c.interaction); await m.kick(why); await logged(c, 'kick', `${m.id}: ${why}`); return reply(c.interaction, `Kicked ${m.user.tag}.`); }),
+  action('timeout', 'Temporarily timeout a member', PermissionFlagsBits.ModerateMembers, [option.member(), option.integer('minutes', 'Timeout duration in minutes', true, { min_value: 1, max_value: 40320 }), reasonOption], async (c) => { const m = await member(c); if (!(await authorizeTarget(c, m))) return; const minutes = c.interaction.options.getInteger('minutes'); await m.timeout(minutes * 60000, reason(c.interaction)); await logged(c, 'timeout', `${m.id}: ${minutes}m`); return reply(c.interaction, `Timed out ${m.user.tag} for ${minutes} minutes.`); }),
+  action('untimeout', 'Remove a member timeout', PermissionFlagsBits.ModerateMembers, targetOptions, async (c) => { const m = await member(c); if (!(await authorizeTarget(c, m))) return; await m.timeout(null, reason(c.interaction)); await logged(c, 'untimeout', m.id); return reply(c.interaction, `Removed ${m.user.tag}'s timeout.`); }),
+  action('warn', 'Add a documented warning', PermissionFlagsBits.ModerateMembers, [option.member(), option.text('reason', 'Warning reason', true, { max_length: 400 })], async (c) => { const m = await member(c); const why = c.interaction.options.getString('reason'); let row; await c.store.updateGuild(c.interaction.guildId, (g) => { g.warnings ??= {}; g.warnings[m.id] ??= []; row = { id: crypto.randomUUID(), reason: why, moderatorId: c.interaction.user.id, at: new Date().toISOString() }; g.warnings[m.id].push(row); }); await logged(c, 'warn', `${m.id}: ${why}`); return reply(c.interaction, `Warned ${m.user.tag}. Warning ID: ${row.id}`); }),
+  action('warnings', 'List a member’s warnings', PermissionFlagsBits.ModerateMembers, [option.member()], async (c) => { const u = c.interaction.options.getUser('user'); const rows = c.store.guild(c.interaction.guildId).warnings?.[u.id] || []; return reply(c.interaction, truncate(rows.map((x) => `${x.id} — ${x.reason} (<@${x.moderatorId}>, ${x.at})`).join('\n') || 'No warnings.')); }),
+  action('warning-remove', 'Remove one warning by ID', PermissionFlagsBits.ModerateMembers, [option.member(), option.text('id', 'Warning ID')], async (c) => { const u = c.interaction.options.getUser('user'); const id = c.interaction.options.getString('id'); let removed = false; await c.store.updateGuild(c.interaction.guildId, (g) => { const rows = g.warnings?.[u.id] || []; const next = rows.filter((x) => x.id !== id); removed = next.length !== rows.length; if (g.warnings) g.warnings[u.id] = next; }); return reply(c.interaction, removed ? 'Warning removed.' : 'Warning not found.'); }),
+  action('warnings-clear', 'Clear all warnings for a member', PermissionFlagsBits.ModerateMembers, [option.member()], async (c) => { const u = c.interaction.options.getUser('user'); await c.store.updateGuild(c.interaction.guildId, (g) => { g.warnings ??= {}; g.warnings[u.id] = []; }); await logged(c, 'warnings-clear', u.id); return reply(c.interaction, 'Warnings cleared.'); }),
+  action('purge', 'Bulk-delete recent messages', PermissionFlagsBits.ManageMessages, [option.integer('count', 'Messages to delete', true, { min_value: 1, max_value: 100 })], async (c) => { const count = c.interaction.options.getInteger('count'); const deleted = await c.interaction.channel.bulkDelete(count, true); await logged(c, 'purge', `${deleted.size} in ${c.interaction.channelId}`); return reply(c.interaction, `Deleted ${deleted.size} messages (messages older than 14 days are skipped).`); }),
+  action('slowmode', 'Set channel slowmode in seconds', PermissionFlagsBits.ManageChannels, [option.integer('seconds', 'Slowmode seconds (0 disables)', true, { min_value: 0, max_value: 21600 })], async (c) => { const seconds = c.interaction.options.getInteger('seconds'); await c.interaction.channel.setRateLimitPerUser(seconds, reason(c.interaction)); return reply(c.interaction, `Slowmode set to ${seconds} seconds.`); }),
+  action('lock', 'Prevent everyone from sending in this channel', PermissionFlagsBits.ManageChannels, [reasonOption], async (c) => { await c.interaction.channel.permissionOverwrites.edit(c.interaction.guild.roles.everyone, { SendMessages: false }, { reason: reason(c.interaction) }); return reply(c.interaction, 'Channel locked.'); }),
+  action('unlock', 'Restore inherited sending permission', PermissionFlagsBits.ManageChannels, [reasonOption], async (c) => { await c.interaction.channel.permissionOverwrites.edit(c.interaction.guild.roles.everyone, { SendMessages: null }, { reason: reason(c.interaction) }); return reply(c.interaction, 'Channel unlocked.'); }),
+  action('nick', 'Change or clear a member nickname', PermissionFlagsBits.ManageNicknames, [option.member(), option.text('nickname', 'New nickname; omit to clear', false, { max_length: 32 }), reasonOption], async (c) => { const m = await member(c); if (!(await authorizeTarget(c, m))) return; await m.setNickname(c.interaction.options.getString('nickname'), reason(c.interaction)); return reply(c.interaction, 'Nickname updated.'); }),
+  action('role-add', 'Add a role to a member', PermissionFlagsBits.ManageRoles, [option.member(), option.role()], async (c) => { const m = await member(c); const r = c.interaction.options.getRole('role'); if (!(await authorizeTarget(c, m)) || !(await authorizeRole(c, r))) return; await m.roles.add(r, reason(c.interaction)); await logged(c, 'role-add', `${r.id} to ${m.id}`); return reply(c.interaction, `Added ${r.name} to ${m.user.tag}.`); }),
+  action('role-remove', 'Remove a role from a member', PermissionFlagsBits.ManageRoles, [option.member(), option.role()], async (c) => { const m = await member(c); const r = c.interaction.options.getRole('role'); if (!(await authorizeTarget(c, m)) || !(await authorizeRole(c, r))) return; await m.roles.remove(r, reason(c.interaction)); await logged(c, 'role-remove', `${r.id} from ${m.id}`); return reply(c.interaction, `Removed ${r.name} from ${m.user.tag}.`); }),
+  action('move', 'Move a member to a voice channel', PermissionFlagsBits.MoveMembers, [option.member(), option.channel('channel')], async (c) => { const m = await member(c); const ch = c.interaction.options.getChannel('channel'); if (!m.voice.channel) return reply(c.interaction, 'That member is not in voice.'); if (!ch.isVoiceBased()) return reply(c.interaction, 'Choose a voice channel.'); await m.voice.setChannel(ch, reason(c.interaction)); return reply(c.interaction, `Moved ${m.user.tag}.`); }),
+  action('voice-mute', 'Server-mute a voice member', PermissionFlagsBits.MuteMembers, targetOptions, async (c) => { const m = await member(c); await m.voice.setMute(true, reason(c.interaction)); return reply(c.interaction, `Voice-muted ${m.user.tag}.`); }),
+  action('voice-unmute', 'Remove a member’s server mute', PermissionFlagsBits.MuteMembers, targetOptions, async (c) => { const m = await member(c); await m.voice.setMute(false, reason(c.interaction)); return reply(c.interaction, `Voice-unmuted ${m.user.tag}.`); }),
+  action('voice-deafen', 'Server-deafen a voice member', PermissionFlagsBits.DeafenMembers, targetOptions, async (c) => { const m = await member(c); await m.voice.setDeaf(true, reason(c.interaction)); return reply(c.interaction, `Voice-deafened ${m.user.tag}.`); }),
+  action('voice-undeafen', 'Remove a member’s server deafen', PermissionFlagsBits.DeafenMembers, targetOptions, async (c) => { const m = await member(c); await m.voice.setDeaf(false, reason(c.interaction)); return reply(c.interaction, `Voice-undeafened ${m.user.tag}.`); }),
+  action('note-add', 'Add a private staff note about a member', PermissionFlagsBits.ModerateMembers, [option.member(), option.text('text', 'Staff note', true, { max_length: 500 })], async (c) => { const u = c.interaction.options.getUser('user'); const text = c.interaction.options.getString('text'); await c.store.updateGuild(c.interaction.guildId, (g) => { g.notes ??= {}; g.notes[u.id] ??= []; g.notes[u.id].push({ id: crypto.randomUUID(), text, authorId: c.interaction.user.id, at: new Date().toISOString() }); }); return reply(c.interaction, 'Staff note added.'); }),
+  action('note-list', 'List private staff notes for a member', PermissionFlagsBits.ModerateMembers, [option.member()], async (c) => { const u = c.interaction.options.getUser('user'); const rows = c.store.guild(c.interaction.guildId).notes?.[u.id] || []; return reply(c.interaction, truncate(rows.map((x) => `${x.id} — ${x.text} (<@${x.authorId}>)`).join('\n') || 'No staff notes.')); }),
+  action('notes-clear', 'Clear private staff notes for a member', PermissionFlagsBits.ModerateMembers, [option.member()], async (c) => { const u = c.interaction.options.getUser('user'); await c.store.updateGuild(c.interaction.guildId, (g) => { g.notes ??= {}; g.notes[u.id] = []; }); return reply(c.interaction, 'Staff notes cleared.'); }),
+  action('softban', 'Ban then unban to remove recent messages', PermissionFlagsBits.BanMembers, targetOptions, async (c) => { const m = await member(c); if (!(await authorizeTarget(c, m))) return; const why = reason(c.interaction); await m.ban({ deleteMessageSeconds: 604800, reason: why }); await c.interaction.guild.members.unban(m.id, `Softban completion: ${why}`); await logged(c, 'softban', m.id); return reply(c.interaction, `Softbanned ${m.user.tag}.`); }),
+  action('voice-kick', 'Disconnect a member from voice', PermissionFlagsBits.MoveMembers, targetOptions, async (c) => { const m = await member(c); if (!m.voice.channel) return reply(c.interaction, 'That member is not in voice.'); await m.voice.disconnect(reason(c.interaction)); return reply(c.interaction, `Disconnected ${m.user.tag}.`); }),
+];
+
+export const moderationCommand = {
+  name: 'moderation', description: 'Moderate members, messages, roles, and voice',
+  defaultMemberPermissions: PermissionFlagsBits.ModerateMembers,
+  category: 'administration', admin: true, actions: moderationActions,
+  authorize: (i) => requirePermission(i, PermissionFlagsBits.ModerateMembers),
+};
